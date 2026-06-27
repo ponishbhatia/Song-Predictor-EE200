@@ -11,6 +11,17 @@ from collections import defaultdict
 from scipy.signal import spectrogram as sp
 from scipy.ndimage import maximum_filter
 from fingerprint import get_peaks, generate_hashes, match_from_array
+import json
+
+@st.cache_resource
+def load_artist_db():
+    try:
+        with open('artist_db.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+artist_db = load_artist_db()
 
 # ─────────────────────────────────────────
 # PAGE CONFIG
@@ -22,6 +33,21 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────
+# NO MATCH THRESHOLD
+# ─────────────────────────────────────────
+NO_MATCH_THRESHOLD = 10
+
+def get_match_result(ranked):
+    """Returns (matched_song_or_None, top_score, runner_up_score)"""
+    if not ranked:
+        return None, 0, 0
+    top_score       = ranked[0][1]
+    runner_up_score = ranked[1][1] if len(ranked) > 1 else 0
+    if top_score < NO_MATCH_THRESHOLD:
+        return None, top_score, runner_up_score
+    return ranked[0][0], top_score, runner_up_score
+
+# ─────────────────────────────────────────
 # LOAD DATABASE & CONSTELLATIONS
 # ─────────────────────────────────────────
 song_files = glob.glob('songs/*.mp3')
@@ -29,7 +55,11 @@ song_files = glob.glob('songs/*.mp3')
 @st.cache_resource
 def load_database():
     with open('database.pkl', 'rb') as f:
-        return pickle.load(f)
+        data = pickle.load(f)
+    # handle both old format (just database) and new format (dict with metadata)
+    if isinstance(data, dict) and 'database' in data:
+        return data['database'], data.get('metadata', {})
+    return data, {}
 
 @st.cache_data
 def get_all_constellations(_song_files, sr=22050):
@@ -41,7 +71,7 @@ def get_all_constellations(_song_files, sr=22050):
         constellations[song_name] = (peaks_list, f, t)
     return constellations
 
-database = load_database()
+database, metadata = load_database()
 constellations = get_all_constellations(song_files)
 
 # ─────────────────────────────────────────
@@ -106,29 +136,59 @@ if mode == "Single Clip":
         with st.spinner('Fingerprinting...'):
             peaks_list, f, t = get_peaks(y, sr)
             query_hashes = generate_hashes(peaks_list, f, t)
-            matched_song, ranked, offset_counts = match_from_array(y, sr, database)
+            _, ranked, offset_counts = match_from_array(y, sr, database)
 
-        # ── MATCH RESULT BOX ──
-        top_score = ranked[0][1] if ranked else 0
-        runner_up_score = ranked[1][1] if len(ranked) > 1 else 0
-        ratio = round(top_score / runner_up_score, 1) if runner_up_score > 0 else '∞'
+        # ── APPLY THRESHOLD ──
+        matched_song, top_score, runner_up_score = get_match_result(ranked)
 
-        st.markdown(f"""
-        <div style='background:#0d1117; border:1px solid #30363d;
-                    border-radius:10px; padding:20px; margin-bottom:20px'>
-            <p style='color:#58a6ff; font-size:12px;
-                      letter-spacing:2px; margin:0'>MATCH FOUND</p>
-            <h1 style='color:white; margin:5px 0'>{matched_song}</h1>
-            <p style='color:#8b949e; margin:0'>
-                cluster score <b style='color:white'>{top_score}</b> ·
-                <b style='color:white'>{ratio}×</b> the runner-up
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
+        if matched_song is None:
+            # ── NO MATCH BOX ──
+            st.markdown(f"""
+            <div style='background:#0d1117; border:1px solid #ff4444;
+                        border-radius:10px; padding:20px; margin-bottom:20px'>
+                <p style='color:#ff4444; font-size:12px;
+                          letter-spacing:2px; margin:0'>NO MATCH FOUND</p>
+                <h1 style='color:white; margin:5px 0'>Unknown Song</h1>
+                <p style='color:#8b949e; margin:0'>
+                    Best score <b style='color:white'>{top_score}</b> —
+                    below confidence threshold of {NO_MATCH_THRESHOLD}
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
 
-        st.subheader("Top Matches")
-        for name, score in ranked[:5]:
-            st.write(f"**{name}** — score: {score}")
+            st.subheader("Runner Ups")
+            for name, score in ranked[:5]:
+                st.write(f"**{name}** — score: {score}")
+
+            # use top ranked song for graphs
+            graph_song = ranked[0][0] if ranked else None
+
+        else:
+            # ── MATCH FOUND BOX ──
+            ratio = round(top_score / runner_up_score, 1) if runner_up_score > 0 else '∞'
+            info   = artist_db.get(matched_song, {})
+            title  = info.get('title',  matched_song)
+            artist = info.get('artist', 'Unknown Artist')
+
+            st.markdown(f"""
+            <div style='background:#0d1117; border:1px solid #30363d;
+                        border-radius:10px; padding:20px; margin-bottom:20px'>
+                <p style='color:#58a6ff; font-size:12px;
+                          letter-spacing:2px; margin:0'>MATCH FOUND</p>
+                <h1 style='color:white; margin:5px 0'>{title}</h1>
+                <p style='color:#8b949e; margin:2px 0'>by <b style='color:white'>{artist}</b></p>
+                <p style='color:#8b949e; margin:0'>
+                    cluster score <b style='color:white'>{top_score}</b> ·
+                    <b style='color:white'>{ratio}×</b> the runner-up
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.subheader("Top Matches")
+            for name, score in ranked[:5]:
+                st.write(f"**{name}** — score: {score}")
+
+            graph_song = matched_song
 
         # ── STEP 1: FEATURE EXTRACTION ──
         st.markdown("---")
@@ -188,82 +248,84 @@ if mode == "Single Clip":
             st.pyplot(fig2)
             plt.close()
 
-        # ── STEP 2: DATABASE SEARCH ──
-        st.markdown("---")
-        st.markdown("### STEP 2 · DATABASE SEARCH")
-        st.markdown("#### Where in the song?")
-        st.markdown(
-            f"The **{len(query_hashes)} fingerprint hashes** were looked up against "
-            f"every indexed track. Below is the full fingerprint of "
-            f"**{matched_song}** reconstructed from the database. "
-            f"The highlighted window is exactly where the query clip sits inside the full song."
-        )
+        # ── STEP 2 & 3 only if graph_song exists ──
+        if matched_song is not None:
+            # ── STEP 2: DATABASE SEARCH ──
+            st.markdown("---")
+            st.markdown("### STEP 2 · DATABASE SEARCH")
+            st.markdown("#### Where in the song?")
+            st.markdown(
+                f"The **{len(query_hashes)} fingerprint hashes** were looked up against "
+                f"every indexed track. Below is the full fingerprint of "
+                f"**{graph_song}** reconstructed from the database. "
+                f"The highlighted window is exactly where the query clip sits inside the full song."
+            )
 
-        if matched_song in constellations:
-            db_peaks, db_f, db_t = constellations[matched_song]
-            db_freq_idx = [p[1] for p in db_peaks]
-            db_time_idx = [p[0] for p in db_peaks]
+            if graph_song in constellations:
+                db_peaks, db_f, db_t = constellations[graph_song]
+                db_freq_idx = [p[1] for p in db_peaks]
+                db_time_idx = [p[0] for p in db_peaks]
 
-            best_offset = max(offset_counts[matched_song],
-                              key=offset_counts[matched_song].get) \
-                          if offset_counts[matched_song] else 0
+                best_offset = max(offset_counts[graph_song],
+                                  key=offset_counts[graph_song].get) \
+                              if offset_counts.get(graph_song) else 0
 
-            fig3, ax3 = plt.subplots(figsize=(12, 5))
-            fig3.patch.set_facecolor('#0d1117')
-            ax3.set_facecolor('#0d1117')
-            ax3.scatter(db_time_idx, db_freq_idx, c='cyan', s=1, alpha=0.5)
-            ax3.axvspan(best_offset, best_offset + len(t),
-                        alpha=0.15, color='orange', label='Query window')
-            ax3.axvline(best_offset, color='orange', linewidth=1.5)
-            ax3.axvline(best_offset + len(t), color='orange', linewidth=1.5)
-            ax3.set_xlabel('time (frames)', color='white')
-            ax3.set_ylabel('freq bin', color='white')
-            ax3.tick_params(colors='white')
-            for spine in ax3.spines.values():
-                spine.set_edgecolor('#30363d')
-            ax3.legend(facecolor='#0d1117', labelcolor='white')
-            plt.tight_layout()
-            st.pyplot(fig3)
-            plt.close()
+                fig3, ax3 = plt.subplots(figsize=(12, 5))
+                fig3.patch.set_facecolor('#0d1117')
+                ax3.set_facecolor('#0d1117')
+                ax3.scatter(db_time_idx, db_freq_idx, c='cyan', s=1, alpha=0.5)
+                ax3.axvspan(best_offset, best_offset + len(t),
+                            alpha=0.15, color='orange', label='Query window')
+                ax3.axvline(best_offset, color='orange', linewidth=1.5)
+                ax3.axvline(best_offset + len(t), color='orange', linewidth=1.5)
+                ax3.set_xlabel('time (frames)', color='white')
+                ax3.set_ylabel('freq bin', color='white')
+                ax3.tick_params(colors='white')
+                for spine in ax3.spines.values():
+                    spine.set_edgecolor('#30363d')
+                ax3.legend(facecolor='#0d1117', labelcolor='white')
+                plt.tight_layout()
+                st.pyplot(fig3)
+                plt.close()
 
-        # ── STEP 3: THE PROOF ──
-        st.markdown("---")
-        st.markdown("### STEP 3 · THE PROOF")
-        st.markdown("#### The alignment spike")
-        st.markdown(
-            f"Every matched hash votes for a time offset (database frame minus query frame). "
-            f"Chance matches scatter votes randomly, forming a flat noise floor. "
-            f"A genuine match makes them converge: "
-            f"**{top_score} hashes agreed on a single offset**. "
-            f"That spike cannot be a coincidence."
-        )
+            # ── STEP 3: THE PROOF ──
+            st.markdown("---")
+            st.markdown("### STEP 3 · THE PROOF")
+            st.markdown("#### The alignment spike")
+            st.markdown(
+                f"Every matched hash votes for a time offset (database frame minus query frame). "
+                f"Chance matches scatter votes randomly, forming a flat noise floor. "
+                f"A genuine match makes them converge: "
+                f"**{top_score} hashes agreed on a single offset**. "
+                f"That spike cannot be a coincidence."
+            )
 
-        offsets_match = offset_counts.get(matched_song, {})
-        if offsets_match:
-            best_offset_val = max(offsets_match, key=offsets_match.get)
-            best_count = offsets_match[best_offset_val]
+            offsets_match = offset_counts.get(graph_song, {})
+            if offsets_match:
+                best_offset_val = max(offsets_match, key=offsets_match.get)
+                best_count = offsets_match[best_offset_val]
 
-            fig4, ax4 = plt.subplots(figsize=(12, 4))
-            fig4.patch.set_facecolor('#0d1117')
-            ax4.set_facecolor('#0d1117')
-            ax4.bar(list(offsets_match.keys()),
-                    list(offsets_match.values()),
-                    width=2, color='cyan', alpha=0.4)
-            ax4.bar([best_offset_val], [best_count],
-                    width=2, color='orange')
-            ax4.annotate(f'{best_count} hashes\nalign here',
-                         xy=(best_offset_val, best_count),
-                         xytext=(best_offset_val + 50, best_count * 0.8),
-                         color='orange', fontsize=10,
-                         arrowprops=dict(arrowstyle='->', color='orange'))
-            ax4.set_xlabel('time offset (frames)', color='white')
-            ax4.set_ylabel('hashes', color='white')
-            ax4.tick_params(colors='white')
-            for spine in ax4.spines.values():
-                spine.set_edgecolor('#30363d')
-            plt.tight_layout()
-            st.pyplot(fig4)
-            plt.close()
+                fig4, ax4 = plt.subplots(figsize=(12, 4))
+                fig4.patch.set_facecolor('#0d1117')
+                ax4.set_facecolor('#0d1117')
+                ax4.bar(list(offsets_match.keys()),
+                        list(offsets_match.values()),
+                        width=2, color='cyan', alpha=0.4)
+                ax4.bar([best_offset_val], [best_count],
+                        width=2, color='orange')
+                ax4.annotate(f'{best_count} hashes\nalign here\n(line may not be visible as it is very thin)',
+                             xy=(best_offset_val, best_count),
+                             xytext=(best_offset_val + 50, best_count * 0.8),
+                             color='orange', fontsize=10,
+                             arrowprops=dict(arrowstyle='->', color='orange'))
+                ax4.set_xlabel('time offset (frames)', color='white')
+                ax4.set_ylabel('hashes', color='white')
+                ax4.tick_params(colors='white')
+                for spine in ax4.spines.values():
+                    spine.set_edgecolor('#30363d')
+                plt.tight_layout()
+                st.pyplot(fig4)
+                plt.close()
 
         if cleanup:
             os.unlink(tmp_path)
@@ -293,21 +355,26 @@ elif mode == "Batch Mode":
                 tmp_path = tmp.name
 
             y, sr = librosa.load(tmp_path, sr=22050, mono=True)
-            matched_song, ranked, _ = match_from_array(y, sr, database)
+            _, ranked, _ = match_from_array(y, sr, database)
+
+            # apply threshold
+            matched_song, top_score, _ = get_match_result(ranked)
+            prediction = matched_song if matched_song else "none"
 
             filename_no_ext = os.path.splitext(uploaded.name)[0]
-            results.append((filename_no_ext, matched_song))
+            results.append((filename_no_ext, prediction))
 
             os.unlink(tmp_path)
             progress.progress((i + 1) / len(uploaded_files))
 
         st.subheader("Results")
         for filename, prediction in results:
-            st.write(f"**{filename}** → {prediction}")
+            icon = "✓" if prediction != "none" else "✗"
+            st.write(f"{icon} **{filename}** → {prediction}")
 
-        csv_content = "filename,prediction\n"
+        csv_content = '"filename","prediction"\n'
         for filename, prediction in results:
-            csv_content += f"{filename},{prediction}\n"
+            csv_content += f'"{filename}","{prediction}"\n'
 
         st.download_button(
             label="📥 Download results.csv",
@@ -322,7 +389,7 @@ elif mode == "Batch Mode":
 # ─────────────────────────────────────────
 elif mode == "Library":
     st.header("🎵 Song Library")
-    st.markdown(f"**{len(song_files)} songs indexed in database**")
+    st.markdown(f"**{len(song_files)} songs indexed in database. Song indexing has been stored in a database file which is interpreted by the app.**")
 
     song_hash_counts = defaultdict(int)
     for entries in database.values():
@@ -341,8 +408,8 @@ elif mode == "Library":
                     peaks_list, f_lib, t_lib = constellations[song_name]
 
                     fig, ax = plt.subplots(figsize=(4, 3))
-                    fig.patch.set_facecolor('black')
-                    ax.set_facecolor('black')
+                    fig.patch.set_facecolor('white')
+                    ax.set_facecolor('white')
 
                     if peaks_list:
                         peak_freq_idx = [p[1] for p in peaks_list]
@@ -363,5 +430,10 @@ elif mode == "Library":
                 except Exception as e:
                     st.error(f"Could not load {song_name}")
 
-                st.markdown(f"**{song_name}**")
+                # show title and artist from metadata if available
+                info   = artist_db.get(song_name, {})
+                title  = info.get('title',  song_name)
+                artist = info.get('artist', 'Unknown Artist')
+                st.markdown(f"**{title}**")
+                st.markdown(f"*{artist}*")
                 st.markdown(f"`{song_hash_counts[song_name]:,} hashes`")
